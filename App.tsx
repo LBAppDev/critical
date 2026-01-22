@@ -4,16 +4,17 @@ import GlitchText from './components/GlitchText';
 import CityMap from './components/CityMap';
 import LobbyView from './components/LobbyView';
 import { INITIAL_SYSTEM_STATE, ROLE_DESCRIPTIONS, ACTIONS } from './constants';
-import { GamePhase, RoleType, Player, GameSession, Action, NetworkMessage } from './types';
+import { GamePhase, RoleType, Player, GameSession, Action } from './types';
 import * as Engine from './services/engine';
-import { network, ConnectionStatus } from './services/network';
+import { api, ConnectionStatus } from './services/network'; // Updated Import
 
 export default function App() {
   // --- STATE ---
-  const [playerId] = useState(() => network.myId);
-  const [myPlayer, setMyPlayer] = useState<Player>({ id: playerId, name: '', role: null, isHost: false });
+  // We keep playerId in session storage to survive refreshes if needed, 
+  // or just memory for now.
+  const [playerId, setPlayerId] = useState<string | null>(null);
+  const [lobbyCode, setLobbyCode] = useState<string | null>(null);
   
-  // Game State (Synced from Network)
   const [players, setPlayers] = useState<Player[]>([]);
   const [session, setSession] = useState<GameSession>({
     phase: GamePhase.LOBBY,
@@ -24,7 +25,6 @@ export default function App() {
     lobbyCode: ''
   });
 
-  // UI State
   const [connStatus, setConnStatus] = useState<ConnectionStatus>('IDLE');
   const [connError, setConnError] = useState<string | null>(null);
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
@@ -32,166 +32,79 @@ export default function App() {
   const [selectedSectorId, setSelectedSectorId] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // --- NETWORK LISTENERS ---
+  const myPlayer = players.find(p => p.id === playerId) || { id: '?', name: 'Unknown', role: null, isHost: false };
+
+  // --- POLLING LOOP ---
   useEffect(() => {
-    // 1. Connection Status
-    const unsubStatus = network.onStatusChange((status, error) => {
-        console.log('[APP] Network Status:', status);
-        setConnStatus(status);
-        if (error) setConnError(error);
-    });
+      if (!playerId || !lobbyCode) return;
 
-    // 2. Game State Updates (The "GET" equivalent, pushed via WebSocket/DataChannel)
-    const unsubState = network.onStateUpdate((newSession, newPlayers) => {
-        setSession(newSession);
-        setPlayers(newPlayers);
-        
-        // Sync my role info
-        const me = newPlayers.find(p => p.id === playerId);
-        if (me) {
-            setMyPlayer(prev => ({ ...prev, ...me }));
-        }
-    });
+      const poll = async () => {
+          try {
+              const data = await api.getGameState(lobbyCode, playerId);
+              setSession(data.session);
+              setPlayers(data.players);
+              setConnStatus('CONNECTED');
+          } catch (e) {
+              console.error(e);
+              setConnStatus('ERROR');
+              setConnError("Lost connection to mainframe");
+          }
+      };
 
-    return () => {
-        unsubStatus();
-        unsubState();
-    };
-  }, [playerId]);
-
-
-  // --- HOST SIMULATION LOOP ---
-  // The host runs the engine and pushes state to everyone else
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-
-    if (myPlayer.isHost && session.phase === GamePhase.PLAYING) {
-      interval = setInterval(() => {
-        // We act on the *current* session state
-        // In a real server, this would be locked/transactional.
-        // Here we use the functional update to ensure we have latest.
-        
-        let currentSession = session; 
-        // Note: Using a ref for session inside interval is better, but since we rely on setSession,
-        // we essentially re-create the interval logic on session change or use functional update.
-        // To avoid jitter, we will do a functional update but we need to calculate 'next' state carefully.
-        
-        // Actually, easiest pattern for this "Host is Server" is to calculate next state
-        // and push it via network.hostPushUpdate().
-        
-        const nextTime = session.timeRemaining - 1;
-        
-        // 1. Check Victory/Loss
-        if (nextTime <= 0) {
-            const finalSession = { ...session, phase: GamePhase.VICTORY };
-            network.hostPushUpdate(finalSession, players);
-            return;
-        }
-
-        // 2. System Decay
-        let nextSystem = Engine.calculateSystemDecay(session.system);
-
-        // 3. Random Events
-        const newEvent = Engine.generateEvent(session.round, session.system.sectors);
-        let currentEvents = [...session.events];
-        if (newEvent) {
-            currentEvents.unshift(newEvent);
-            nextSystem = Engine.applyEventImpact(nextSystem, newEvent);
-        }
-
-        // 4. Bot Actions
-        players.filter(p => p.isBot).forEach(bot => {
-             if (Math.random() < 0.1) { 
-                 const botAction = ACTIONS.find(a => a.role === bot.role);
-                 if (botAction) {
-                     const target = nextSystem.sectors[Math.floor(Math.random() * nextSystem.sectors.length)].id;
-                     nextSystem = Engine.applyAction(nextSystem, botAction, target);
-                 }
-             }
-        });
-        
-        // 5. Check Collapse
-        const gameOverCheck = Engine.checkGameOver(nextSystem);
-        const nextPhase = gameOverCheck.isOver ? GamePhase.GAME_OVER : GamePhase.PLAYING;
-
-        const nextSession = {
-            ...session,
-            timeRemaining: nextTime,
-            system: nextSystem,
-            events: currentEvents,
-            phase: nextPhase
-        };
-
-        // PUSH TO NETWORK
-        network.hostPushUpdate(nextSession, players);
-
-      }, 1000);
-    }
-
-    return () => clearInterval(interval);
-  }, [myPlayer.isHost, session, players]); // Re-bind when session changes to keep strict sync
+      // Poll every 1s
+      poll(); // Initial call
+      const interval = setInterval(poll, 1000);
+      return () => clearInterval(interval);
+  }, [playerId, lobbyCode]);
 
   // --- ACTIONS ---
 
   const handleCreateLobby = async (name: string) => {
+      setConnStatus('CONNECTING');
       setConnError(null);
       try {
-          const code = await network.createLobby(name);
-          setMyPlayer(p => ({ ...p, name, isHost: true, role: RoleType.COMMANDER }));
-          // Note: onStateUpdate will fire and setSession
-      } catch (e) {
-          console.error(e);
+          const res = await api.createRoom(name);
+          setPlayerId(res.playerId);
+          setLobbyCode(res.code);
+          setConnStatus('CONNECTED');
+      } catch (e: any) {
+          setConnStatus('ERROR');
+          setConnError(e.message);
       }
   };
 
   const handleJoinLobby = async (name: string, code: string) => {
+      setConnStatus('CONNECTING');
       setConnError(null);
       try {
-          await network.joinLobby(code.toUpperCase(), name);
-          setMyPlayer(p => ({ ...p, name, isHost: false }));
-      } catch (e) {
-          console.error(e);
+          const res = await api.joinRoom(code.toUpperCase(), name);
+          setPlayerId(res.playerId);
+          setLobbyCode(res.code);
+          setConnStatus('CONNECTED');
+      } catch (e: any) {
+          setConnStatus('ERROR');
+          setConnError(e.message);
       }
   };
 
   const handleStartGame = async () => {
-      if (!myPlayer.isHost) return;
-      try {
-          await network.request('START_REQUEST', {});
-      } catch (e) {
-          console.error("Start failed", e);
-      }
+      if (!lobbyCode) return;
+      await api.startGame(lobbyCode);
   };
 
-  const handleAddBot = () => {
-      if (myPlayer.isHost) network.hostAddBot();
-  };
+  const handleAddBot = async () => {
+      if (!lobbyCode) return;
+      await api.addBot(lobbyCode);
+  }
 
   const handleActionClick = async (action: Action) => {
-      if (cooldowns[action.id]) return;
+      if (cooldowns[action.id] || !playerId || !lobbyCode) return;
       
-      // Optimistic UI update for Cooldown
+      // Optimistic UI
       setCooldowns(prev => ({ ...prev, [action.id]: action.cooldown }));
-      setActionLog(l => [`[CMD] EXECUTING ${action.label}...`, ...l].slice(0, 10));
+      setActionLog(l => [`[CMD] ${action.label.toUpperCase()} INITIATED...`, ...l].slice(0, 10));
 
-      // Network Request
-      if (myPlayer.isHost) {
-          // Host applies immediately
-          const nextSystem = Engine.applyAction(session.system, action, selectedSectorId || undefined);
-          const nextSession = { ...session, system: nextSystem };
-          network.hostPushUpdate(nextSession, players);
-      } else {
-          // Client sends request
-          network.request('ACTION_REQUEST', { 
-              actionId: action.id, 
-              targetSectorId: selectedSectorId,
-              playerId: myPlayer.id 
-          }).then(() => {
-              // Success feedback
-          }).catch(err => {
-              setActionLog(l => [`[ERR] ${err.message}`, ...l]);
-          });
-      }
+      await api.sendAction(lobbyCode, playerId, action.id, selectedSectorId || undefined);
   };
 
   // --- COOLDOWN TICKER ---
@@ -214,7 +127,7 @@ export default function App() {
 
   // --- RENDER ---
   
-  if (session.phase === GamePhase.LOBBY) {
+  if (!playerId || !lobbyCode || session.phase === GamePhase.LOBBY) {
       return (
           <LobbyView 
               playerCount={players.length}

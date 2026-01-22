@@ -65,16 +65,12 @@ export interface GameSession {
   system: SystemState;
   events: GameEvent[];
   lobbyCode: string;
+  lastTick?: number; // For lazy simulation updates
 }
 
-// Network Messages
-// We use an RPC-style structure to mimic HTTP POST/GET
-export type NetworkMessage = 
-  // Requests
-  | { type: 'JOIN_REQUEST'; payload: { name: string; playerId: string }; msgId: string }
-  | { type: 'START_REQUEST'; payload: {}; msgId: string }
-  | { type: 'ACTION_REQUEST'; payload: { actionId: string; targetSectorId?: string; playerId: string }; msgId: string }
-  // Responses
-  | { type: 'RESPONSE'; payload: { success: boolean; data?: any; error?: string }; msgId: string } // Correlates to request msgId
-  // Broadcasts (Server -> Client push)
-  | { type: 'STATE_UPDATE'; payload: { session: GameSession; players: Player[] } };
+// Simplified Network Response
+export interface ApiResponse<T> {
+    success: boolean;
+    data?: T;
+    error?: string;
+}
