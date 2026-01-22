@@ -6,15 +6,18 @@ import LobbyView from './components/LobbyView';
 import { INITIAL_SYSTEM_STATE, ROLE_DESCRIPTIONS, ACTIONS } from './constants';
 import { GamePhase, RoleType, Player, GameSession, Action, NetworkMessage } from './types';
 import * as Engine from './services/engine';
-import { network, generateLobbyCode, autoAssignRole } from './services/network';
+import { network, autoAssignRole, ConnectionStatus } from './services/network';
 
 export default function App() {
   // --- STATE ---
-  const [playerId] = useState(() => Math.random().toString(36).substr(2, 9));
+  const [playerId] = useState(() => network.myId); // Use network ID as reliable ID
   const [myPlayer, setMyPlayer] = useState<Player>({ id: playerId, name: '', role: null, isHost: false });
   const [players, setPlayers] = useState<Player[]>([]);
   const [lobbyCode, setLobbyCode] = useState<string | null>(null);
   
+  const [connStatus, setConnStatus] = useState<ConnectionStatus>('IDLE');
+  const [connError, setConnError] = useState<string | null>(null);
+
   const [session, setSession] = useState<GameSession>({
     phase: GamePhase.LOBBY,
     round: 1,
@@ -35,25 +38,19 @@ export default function App() {
     stateRef.current = { players, session, myPlayer };
   }, [players, session, myPlayer]);
 
-  // --- 1. CONNECTION MANAGEMENT ---
-  // Connect whenever lobbyCode changes
+  // --- 1. NETWORK SETUP ---
   useEffect(() => {
-    if (lobbyCode) {
-      console.log(`[NET] Connecting to channel: entropy-protocol-${lobbyCode}`);
-      network.connect(lobbyCode);
-      return () => {
-        console.log('[NET] Disconnecting...');
-        network.disconnect();
-      };
-    }
-  }, [lobbyCode]);
+    // Status Listener
+    const unsubStatus = network.onStatusChange((status, error) => {
+        console.log('[APP] Network Status:', status, error);
+        setConnStatus(status);
+        if (error) setConnError(error);
+    });
 
-  // --- 2. MESSAGE HANDLING ---
-  useEffect(() => {
-    const unsub = network.subscribe((msg: NetworkMessage) => {
+    // Message Listener
+    const unsubMsg = network.subscribe((msg: NetworkMessage) => {
       const { myPlayer: currentMe, players: currentPlayers, session: currentSession } = stateRef.current;
-      console.log('[NET] RX:', msg.type, msg);
-
+      
       switch (msg.type) {
         case 'JOIN_REQUEST':
           if (currentMe.isHost) {
@@ -62,17 +59,14 @@ export default function App() {
           break;
 
         case 'LOBBY_STATE':
-          // If I am NOT the host, I accept the authoritative state
-          if (!currentMe.isHost) {
-            // Merge players (careful not to lose my local info if needed, but usually server is authority)
-            setPlayers(msg.payload.players);
-            setSession(prev => ({ ...prev, ...msg.payload.session }));
-
-            // Update my own role if the host assigned one
-            const meInList = msg.payload.players.find(p => p.id === currentMe.id);
-            if (meInList && meInList.role !== currentMe.role) {
+          // All clients accept the authoritative state
+          setPlayers(msg.payload.players);
+          setSession(prev => ({ ...prev, ...msg.payload.session }));
+          
+          // Sync my role
+          const meInList = msg.payload.players.find(p => p.id === currentMe.id);
+          if (meInList && meInList.role !== currentMe.role) {
                setMyPlayer(prev => ({ ...prev, role: meInList.role }));
-            }
           }
           break;
 
@@ -87,41 +81,21 @@ export default function App() {
           break;
 
         case 'GAME_TICK':
+           // Only update session if not host (Host is the source of truth)
            if (!currentMe.isHost) {
                setSession(msg.payload.session); 
            }
            break;
       }
     });
-    return () => unsub();
+
+    return () => {
+        unsubStatus();
+        unsubMsg();
+    };
   }, []);
 
-  // --- 3. HEARTBEAT / SYNC LOOP ---
-  useEffect(() => {
-      if (!lobbyCode) return;
-
-      const interval = setInterval(() => {
-          const { myPlayer, players, session } = stateRef.current;
-
-          // HOST: Broadcast state constantly in lobby so new joiners get it
-          if (myPlayer.isHost && session.phase === GamePhase.LOBBY) {
-              network.send({ type: 'LOBBY_STATE', payload: { players, session } });
-          }
-
-          // CLIENT: If I'm not in the player list yet, keep knocking
-          if (!myPlayer.isHost && session.phase === GamePhase.LOBBY) {
-              const amIJoined = players.some(p => p.id === myPlayer.id);
-              if (!amIJoined) {
-                  console.log('[NET] Sending JOIN_REQUEST...');
-                  network.send({ type: 'JOIN_REQUEST', payload: { player: myPlayer, code: lobbyCode } });
-              }
-          }
-      }, 500); // Faster heartbeat (500ms) for snappier joins
-
-      return () => clearInterval(interval);
-  }, [lobbyCode]);
-
-  // --- HOST GAME LOOP ---
+  // --- 2. HOST GAME LOOP ---
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
 
@@ -180,7 +154,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, [myPlayer.isHost, session.phase, players]);
 
-  // --- COOLDOWN TICK (Client Side) ---
+  // --- 3. COOLDOWNS ---
   useEffect(() => {
       if (session.phase !== GamePhase.PLAYING) return;
       const interval = setInterval(() => {
@@ -198,10 +172,9 @@ export default function App() {
   }, [session.phase]);
 
 
-  // --- HOST LOGIC METHODS ---
+  // --- HOST METHODS ---
   const handlePlayerJoinRequest = (newPlayer: Player) => {
       const { players, session } = stateRef.current;
-      console.log('[HOST] Processing Join Request:', newPlayer.name);
       
       const existingIndex = players.findIndex(p => p.id === newPlayer.id);
       
@@ -219,6 +192,8 @@ export default function App() {
       });
 
       setPlayers(finalPlayers);
+      
+      // Immediately broadcast update so the new player gets the state
       network.send({ type: 'LOBBY_STATE', payload: { players: finalPlayers, session } });
   };
 
@@ -242,6 +217,7 @@ export default function App() {
       setSession(prev => {
           let targetSectorId = undefined;
           if (action.targetType === 'SECTOR') {
+             // Basic AI targeting for now if not specified (future: pass target in action payload)
              if (action.role === RoleType.ENGINEER) {
                  targetSectorId = prev.system.sectors.sort((a,b) => a.structuralIntegrity - b.structuralIntegrity)[0].id;
              } else if (action.role === RoleType.BIO_SEC) {
@@ -261,24 +237,35 @@ export default function App() {
       setActionLog(prev => [`[ACT] ${actor?.name}: ${action.label}`, ...prev].slice(0, 8));
   };
 
-  // --- INTERACTION METHODS ---
-  const handleCreateLobby = (name: string) => {
-      const code = generateLobbyCode();
+  // --- UI HANDLERS ---
+  const handleCreateLobby = async (name: string) => {
+      setConnError(null);
       const me = { id: playerId, name, role: RoleType.COMMANDER, isHost: true };
       
-      // Update state in specific order
-      setMyPlayer(me);
-      setPlayers([me]);
-      setSession(prev => ({ ...prev, lobbyCode: code }));
-      setLobbyCode(code); // This triggers the useEffect connection
+      try {
+          const code = await network.startHost(name);
+          setMyPlayer(me);
+          setPlayers([me]);
+          setSession(prev => ({ ...prev, lobbyCode: code }));
+          setLobbyCode(code);
+      } catch (err) {
+          console.error("Failed to host:", err);
+          // Error handling done via listener
+      }
   };
 
-  const handleJoinLobby = (name: string, code: string) => {
+  const handleJoinLobby = async (name: string, code: string) => {
+      setConnError(null);
       const upperCode = code.toUpperCase();
       const me = { id: playerId, name, role: null, isHost: false };
       
-      setMyPlayer(me);
-      setLobbyCode(upperCode); // This triggers the useEffect connection
+      try {
+          await network.joinGame(upperCode, name);
+          setMyPlayer(me);
+          setLobbyCode(upperCode);
+      } catch (err) {
+          console.error("Failed to join:", err);
+      }
   };
 
   const handleStartGame = () => {
@@ -305,6 +292,8 @@ export default function App() {
               lobbyCode={lobbyCode}
               players={players}
               isHost={myPlayer.isHost}
+              connStatus={connStatus}
+              connError={connError}
               onCreate={handleCreateLobby}
               onJoin={handleJoinLobby}
               onStart={handleStartGame}
