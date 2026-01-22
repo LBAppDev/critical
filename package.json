@@ -11,8 +11,8 @@
   "dependencies": {
     "react-dom": "^19.2.3",
     "react": "^19.2.3",
-    "lucide-react": "^0.562.0",
-    "recharts": "^3.7.0"
+    "lucide-react": "0.294.0",
+    "recharts": "2.10.3"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

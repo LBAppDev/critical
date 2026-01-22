@@ -10,7 +10,7 @@ import { network, generateLobbyCode, autoAssignRole } from './services/network';
 
 export default function App() {
   // --- STATE ---
-  const [playerId] = useState(Math.random().toString(36).substr(2, 9));
+  const [playerId] = useState(() => Math.random().toString(36).substr(2, 9));
   const [myPlayer, setMyPlayer] = useState<Player>({ id: playerId, name: '', role: null, isHost: false });
   const [players, setPlayers] = useState<Player[]>([]);
   const [lobbyCode, setLobbyCode] = useState<string | null>(null);
@@ -35,39 +35,59 @@ export default function App() {
     stateRef.current = { players, session, myPlayer };
   }, [players, session, myPlayer]);
 
-  // --- NETWORK LISTENERS ---
+  // --- 1. CONNECTION MANAGEMENT ---
+  // Connect whenever lobbyCode changes
+  useEffect(() => {
+    if (lobbyCode) {
+      console.log(`[NET] Connecting to channel: entropy-protocol-${lobbyCode}`);
+      network.connect(lobbyCode);
+      return () => {
+        console.log('[NET] Disconnecting...');
+        network.disconnect();
+      };
+    }
+  }, [lobbyCode]);
+
+  // --- 2. MESSAGE HANDLING ---
   useEffect(() => {
     const unsub = network.subscribe((msg: NetworkMessage) => {
-      const { myPlayer, players } = stateRef.current;
+      const { myPlayer: currentMe, players: currentPlayers, session: currentSession } = stateRef.current;
+      console.log('[NET] RX:', msg.type, msg);
 
       switch (msg.type) {
         case 'JOIN_REQUEST':
-          if (myPlayer.isHost) {
+          if (currentMe.isHost) {
             handlePlayerJoinRequest(msg.payload.player);
           }
           break;
+
         case 'LOBBY_STATE':
-          if (!myPlayer.isHost) {
+          // If I am NOT the host, I accept the authoritative state
+          if (!currentMe.isHost) {
+            // Merge players (careful not to lose my local info if needed, but usually server is authority)
             setPlayers(msg.payload.players);
             setSession(prev => ({ ...prev, ...msg.payload.session }));
-            
-            // Sync my role from the server state
-            const me = msg.payload.players.find(p => p.id === myPlayer.id);
-            if (me && me.role !== myPlayer.role) {
-              setMyPlayer(prev => ({ ...prev, role: me.role }));
+
+            // Update my own role if the host assigned one
+            const meInList = msg.payload.players.find(p => p.id === currentMe.id);
+            if (meInList && meInList.role !== currentMe.role) {
+               setMyPlayer(prev => ({ ...prev, role: meInList.role }));
             }
           }
           break;
+
         case 'START_GAME':
            setSession(prev => ({ ...prev, phase: GamePhase.PLAYING }));
            break;
+
         case 'PLAYER_ACTION':
-          if (myPlayer.isHost) {
+          if (currentMe.isHost) {
              processAction(msg.payload.actionId, msg.payload.playerId);
           }
           break;
+
         case 'GAME_TICK':
-           if (!myPlayer.isHost) {
+           if (!currentMe.isHost) {
                setSession(msg.payload.session); 
            }
            break;
@@ -76,7 +96,7 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // --- HEARTBEAT SYNC ---
+  // --- 3. HEARTBEAT / SYNC LOOP ---
   useEffect(() => {
       if (!lobbyCode) return;
 
@@ -88,14 +108,15 @@ export default function App() {
               network.send({ type: 'LOBBY_STATE', payload: { players, session } });
           }
 
-          // CLIENT: Spam join request until accepted (seen in player list)
+          // CLIENT: If I'm not in the player list yet, keep knocking
           if (!myPlayer.isHost && session.phase === GamePhase.LOBBY) {
               const amIJoined = players.some(p => p.id === myPlayer.id);
               if (!amIJoined) {
+                  console.log('[NET] Sending JOIN_REQUEST...');
                   network.send({ type: 'JOIN_REQUEST', payload: { player: myPlayer, code: lobbyCode } });
               }
           }
-      }, 1000);
+      }, 500); // Faster heartbeat (500ms) for snappier joins
 
       return () => clearInterval(interval);
   }, [lobbyCode]);
@@ -180,20 +201,17 @@ export default function App() {
   // --- HOST LOGIC METHODS ---
   const handlePlayerJoinRequest = (newPlayer: Player) => {
       const { players, session } = stateRef.current;
+      console.log('[HOST] Processing Join Request:', newPlayer.name);
       
-      // Prevent duplicate join logic if spamming requests
       const existingIndex = players.findIndex(p => p.id === newPlayer.id);
       
       let updatedPlayers = [...players];
       if (existingIndex >= 0) {
-          // Update existing
           updatedPlayers[existingIndex] = { ...updatedPlayers[existingIndex], name: newPlayer.name };
       } else {
-          // Add new
           updatedPlayers.push(newPlayer);
       }
       
-      // Assign Roles
       const assignedRole = autoAssignRole(updatedPlayers);
       const finalPlayers = updatedPlayers.map(p => {
           if (!p.role && p.id === newPlayer.id) return { ...p, role: assignedRole };
@@ -201,7 +219,6 @@ export default function App() {
       });
 
       setPlayers(finalPlayers);
-      // Immediately broadcast to confirm join to client
       network.send({ type: 'LOBBY_STATE', payload: { players: finalPlayers, session } });
   };
 
@@ -223,7 +240,6 @@ export default function App() {
       const actor = stateRef.current.players.find(p => p.id === actorId);
 
       setSession(prev => {
-          // AI Director / Auto-Targeting for Simple Demo
           let targetSectorId = undefined;
           if (action.targetType === 'SECTOR') {
              if (action.role === RoleType.ENGINEER) {
@@ -248,22 +264,21 @@ export default function App() {
   // --- INTERACTION METHODS ---
   const handleCreateLobby = (name: string) => {
       const code = generateLobbyCode();
-      setLobbyCode(code);
       const me = { id: playerId, name, role: RoleType.COMMANDER, isHost: true };
+      
+      // Update state in specific order
       setMyPlayer(me);
       setPlayers([me]);
-      network.connect(code);
       setSession(prev => ({ ...prev, lobbyCode: code }));
+      setLobbyCode(code); // This triggers the useEffect connection
   };
 
   const handleJoinLobby = (name: string, code: string) => {
       const upperCode = code.toUpperCase();
-      setLobbyCode(upperCode);
       const me = { id: playerId, name, role: null, isHost: false };
-      setMyPlayer(me);
       
-      // Connect and let Heartbeat handle the requests
-      network.connect(upperCode);
+      setMyPlayer(me);
+      setLobbyCode(upperCode); // This triggers the useEffect connection
   };
 
   const handleStartGame = () => {
