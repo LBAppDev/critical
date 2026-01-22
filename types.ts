@@ -68,9 +68,13 @@ export interface GameSession {
 }
 
 // Network Messages
+// We use an RPC-style structure to mimic HTTP POST/GET
 export type NetworkMessage = 
-  | { type: 'JOIN_REQUEST'; payload: { player: Player; code: string } }
-  | { type: 'LOBBY_STATE'; payload: { players: Player[]; session: GameSession } }
-  | { type: 'START_GAME'; payload: {} }
-  | { type: 'PLAYER_ACTION'; payload: { actionId: string; playerId: string } }
-  | { type: 'GAME_TICK'; payload: { session: GameSession } };
+  // Requests
+  | { type: 'JOIN_REQUEST'; payload: { name: string; playerId: string }; msgId: string }
+  | { type: 'START_REQUEST'; payload: {}; msgId: string }
+  | { type: 'ACTION_REQUEST'; payload: { actionId: string; targetSectorId?: string; playerId: string }; msgId: string }
+  // Responses
+  | { type: 'RESPONSE'; payload: { success: boolean; data?: any; error?: string }; msgId: string } // Correlates to request msgId
+  // Broadcasts (Server -> Client push)
+  | { type: 'STATE_UPDATE'; payload: { session: GameSession; players: Player[] } };

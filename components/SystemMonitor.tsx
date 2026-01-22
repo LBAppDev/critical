@@ -8,16 +8,27 @@ interface SystemMonitorProps {
 }
 
 const SystemMonitor: React.FC<SystemMonitorProps> = ({ state, className }) => {
+  // Derive aggregate metrics for visualization
+  const avgIntegrity = state.sectors.length > 0
+    ? state.sectors.reduce((acc, s) => acc + s.structuralIntegrity, 0) / state.sectors.length
+    : 100;
+
+  const avgHazard = state.sectors.length > 0
+    ? state.sectors.reduce((acc, s) => acc + s.hazardLevel, 0) / state.sectors.length
+    : 0;
+
+  const containmentLevel = Math.max(0, 100 - avgHazard);
+
   const data = [
-    { subject: 'Integrity', A: state.structuralIntegrity, fullMark: 100 },
-    { subject: 'Power', A: state.powerOutput, fullMark: 100 },
-    { subject: 'Containment', A: state.containmentLevel, fullMark: 100 },
-    { subject: 'Network', A: state.networkStability, fullMark: 100 },
-    { subject: 'Order', A: 100 - state.panicLevel, fullMark: 100 }, // Invert panic so 100 is good
+    { subject: 'Integrity', A: avgIntegrity, fullMark: 100 },
+    { subject: 'Power', A: state.globalPower, fullMark: 100 },
+    { subject: 'Containment', A: containmentLevel, fullMark: 100 },
+    { subject: 'Network', A: state.globalNetwork, fullMark: 100 },
+    { subject: 'Order', A: 100 - state.globalPanic, fullMark: 100 }, // Invert panic so 100 is good
   ];
 
   // Determine color based on overall health
-  const avgHealth = (state.structuralIntegrity + state.powerOutput + state.containmentLevel + (100 - state.panicLevel)) / 4;
+  const avgHealth = (avgIntegrity + state.globalPower + containmentLevel + (100 - state.globalPanic)) / 4;
   const strokeColor = avgHealth < 40 ? '#ef4444' : avgHealth < 70 ? '#f59e0b' : '#10b981';
   const fillColor = avgHealth < 40 ? '#ef4444' : avgHealth < 70 ? '#f59e0b' : '#10b981';
 
