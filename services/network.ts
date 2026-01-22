@@ -1,4 +1,4 @@
-import { GameSession, Player, RoleType, GamePhase, Action } from '../types';
+import { GameSession, Player, RoleType, GamePhase, Action, SystemState } from '../types';
 import { INITIAL_SYSTEM_STATE, ACTIONS } from '../constants';
 import * as Engine from './engine';
 
@@ -8,228 +8,311 @@ export type ConnectionStatus = 'IDLE' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 
 // --- MOCK BACKEND SERVER (Running in Browser Memory/LocalStorage) ---
 // This allows multiple tabs to see the same state (Local Multiplayer)
-class MockServer {
+class MockBackend {
+  
+  // --- STORAGE HELPERS ---
+  
   private getRoomKey(code: string) {
     return `${STORAGE_KEY_PREFIX}${code.toUpperCase()}`;
   }
 
-  private loadRoom(code: string): { session: GameSession, players: Player[] } | null {
-    const raw = localStorage.getItem(this.getRoomKey(code));
-    return raw ? JSON.parse(raw) : null;
+  private getStore(code: string): { session: GameSession, players: Player[], lastUpdated: number } | null {
+    try {
+      const key = this.getRoomKey(code);
+      const item = localStorage.getItem(key);
+      return item ? JSON.parse(item) : null;
+    } catch (e) {
+      console.error("[SERVER] Storage Read Error", e);
+      return null;
+    }
   }
 
-  private saveRoom(code: string, data: { session: GameSession, players: Player[] }) {
-    localStorage.setItem(this.getRoomKey(code), JSON.stringify(data));
+  private setStore(code: string, data: { session: GameSession, players: Player[], lastUpdated: number }) {
+    try {
+      const key = this.getRoomKey(code);
+      localStorage.setItem(key, JSON.stringify(data));
+    } catch (e) {
+      console.error("[SERVER] Storage Write Error", e);
+    }
   }
 
-  // --- API HANDLERS ---
+  // --- CORE API ---
 
   createRoom(hostName: string): { code: string, playerId: string } {
-    const code = Math.random().toString(36).substring(2, 6).toUpperCase();
-    const playerId = `USER-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+    // Generate unique 4-letter code (avoiding ambiguous chars)
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; 
+    let code = '';
+    let attempts = 0;
     
-    const host: Player = {
+    do {
+      code = '';
+      for(let i=0; i<4; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+      attempts++;
+    } while (this.getStore(code) && attempts < 20);
+
+    if (this.getStore(code)) throw new Error("Failed to allocate server capacity (Code Collision)");
+
+    const playerId = `HOST-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+    const hostPlayer: Player = {
       id: playerId,
-      name: hostName,
+      name: hostName.trim().toUpperCase() || 'COMMANDER',
       role: RoleType.COMMANDER,
       isHost: true
     };
 
-    const initialState = {
-      session: {
-        phase: GamePhase.LOBBY,
-        round: 1,
-        timeRemaining: 90,
-        system: JSON.parse(JSON.stringify(INITIAL_SYSTEM_STATE)),
-        events: [],
-        lobbyCode: code,
-        lastTick: Date.now()
-      },
-      players: [host]
+    const initialSession: GameSession = {
+      phase: GamePhase.LOBBY,
+      round: 1,
+      timeRemaining: 90,
+      system: JSON.parse(JSON.stringify(INITIAL_SYSTEM_STATE)),
+      events: [],
+      lobbyCode: code,
+      lastTick: Date.now()
     };
 
-    this.saveRoom(code, initialState);
+    this.setStore(code, {
+      session: initialSession,
+      players: [hostPlayer],
+      lastUpdated: Date.now()
+    });
+
+    console.log(`[SERVER] Room Created: ${code}`);
     return { code, playerId };
   }
 
   joinRoom(code: string, playerName: string): { code: string, playerId: string } {
-    const room = this.loadRoom(code);
-    if (!room) throw new Error("Room not found");
-    if (room.session.phase !== GamePhase.LOBBY) throw new Error("Game already in progress");
+    const cleanCode = code.trim().toUpperCase();
+    const data = this.getStore(cleanCode);
+    
+    if (!data) {
+        console.warn(`[SERVER] Room ${cleanCode} not found in LocalStorage.`);
+        // Debug aid: list available rooms
+        this.logAvailableRooms();
+        throw new Error(`Room ${cleanCode} not found`);
+    }
 
-    const playerId = `USER-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+    if (data.session.phase !== GamePhase.LOBBY) {
+        throw new Error("Mission already in progress");
+    }
+
+    if (data.players.length >= 8) {
+        throw new Error("Squad capacity reached");
+    }
+
+    const playerId = `OP-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
     const newPlayer: Player = {
       id: playerId,
-      name: playerName,
+      name: playerName.trim().toUpperCase() || `OPERATIVE-${data.players.length + 1}`,
       role: null,
       isHost: false
     };
 
-    room.players.push(newPlayer);
-    this.assignRoles(room.players);
-    this.saveRoom(code, room);
-    return { code, playerId };
+    data.players.push(newPlayer);
+    this.rebalanceRoles(data.players);
+    
+    this.setStore(cleanCode, data);
+    console.log(`[SERVER] ${playerName} joined ${cleanCode}`);
+    return { code: cleanCode, playerId };
   }
 
   getGameState(code: string, playerId: string): { session: GameSession, players: Player[] } {
-    const room = this.loadRoom(code);
-    if (!room) throw new Error("Room not found");
+    const data = this.getStore(code);
+    if (!data) throw new Error("Connection lost");
     
     // Lazy Simulation Tick
-    // Since we don't have a real persistent server process, we update the game state
-    // whenever a client requests it, based on how much time passed.
-    if (room.session.phase === GamePhase.PLAYING) {
-       this.processGameTick(room);
-       this.saveRoom(code, room);
+    // Only the first person to query in a 'tick window' triggers the update logic
+    // But since this is LocalStorage, we can just update it safely.
+    if (data.session.phase === GamePhase.PLAYING) {
+       const now = Date.now();
+       if (now - (data.session.lastTick || 0) > 1000) {
+           this.processGameTick(data);
+           this.setStore(code, data);
+       }
     }
     
-    return room;
+    return { session: data.session, players: data.players };
   }
 
   startGame(code: string): boolean {
-    const room = this.loadRoom(code);
-    if (!room) return false;
+    const data = this.getStore(code);
+    if (!data) return false;
     
-    room.session.phase = GamePhase.PLAYING;
-    room.session.lastTick = Date.now();
-    this.assignRoles(room.players); // Ensure roles are set
-    this.saveRoom(code, room);
+    data.session.phase = GamePhase.PLAYING;
+    data.session.lastTick = Date.now();
+    this.rebalanceRoles(data.players); 
+    this.setStore(code, data);
     return true;
   }
 
   performAction(code: string, playerId: string, actionId: string, targetSectorId?: string): boolean {
-    const room = this.loadRoom(code);
-    if (!room) return false;
-    if (room.session.phase !== GamePhase.PLAYING) return false;
+    const data = this.getStore(code);
+    if (!data) return false;
+    if (data.session.phase !== GamePhase.PLAYING) return false;
 
-    // Find Action Config
     const actionDef = ACTIONS.find(a => a.id === actionId);
     if (!actionDef) return false;
 
     // Apply Action Logic
-    room.session.system = Engine.applyAction(room.session.system, actionDef, targetSectorId);
-    
-    // Save
-    this.saveRoom(code, room);
+    data.session.system = Engine.applyAction(data.session.system, actionDef, targetSectorId);
+    this.setStore(code, data);
     return true;
   }
 
   addBot(code: string): boolean {
-      const room = this.loadRoom(code);
-      if (!room) return false;
+      const data = this.getStore(code);
+      if (!data) return false;
       
       const botId = `BOT-${Math.random().toString(36).substr(2, 4)}`;
-      room.players.push({
+      data.players.push({
           id: botId,
-          name: `UNIT-${Math.floor(Math.random()*100)}`,
+          name: `ANDROID-${Math.floor(Math.random()*999)}`,
           isHost: false,
           isBot: true,
           role: null
       });
-      this.assignRoles(room.players);
-      this.saveRoom(code, room);
+      this.rebalanceRoles(data.players);
+      this.setStore(code, data);
       return true;
   }
 
-  // --- HELPERS ---
+  // --- INTERNAL LOGIC ---
 
-  private assignRoles(players: Player[]) {
+  private rebalanceRoles(players: Player[]) {
     const ESSENTIAL = [RoleType.COMMANDER, RoleType.ENGINEER, RoleType.BIO_SEC, RoleType.COMMS];
     const SUPPORT = [RoleType.SECURITY, RoleType.LOGISTICS];
     
-    const takenRoles = new Set(players.map(p => p.role).filter(r => r !== null));
+    // Reset non-host roles to ensure optimal distribution? 
+    // No, keep existing, just fill gaps.
+    
+    const currentRoles = new Set(players.map(p => p.role).filter(r => r !== null));
     
     players.forEach(p => {
-        if (p.role) return;
+        if (p.role) return; // Already has role
 
+        // Try to assign essential roles first
         let assigned: RoleType | null = null;
         for (const r of ESSENTIAL) {
-            if (!takenRoles.has(r)) { assigned = r; break; }
-        }
-        if (!assigned) {
-            for (const r of SUPPORT) {
-                if (!takenRoles.has(r)) { assigned = r; break; }
+            if (!currentRoles.has(r)) { 
+                assigned = r; 
+                break; 
             }
         }
+        
+        // Then support
+        if (!assigned) {
+            for (const r of SUPPORT) {
+                if (!currentRoles.has(r)) { 
+                    assigned = r; 
+                    break; 
+                }
+            }
+        }
+        
+        // Fallback (Duplicates allowed for support roles usually, but for this game: Security)
         if (!assigned) assigned = RoleType.SECURITY;
 
         p.role = assigned;
-        takenRoles.add(assigned);
+        currentRoles.add(assigned);
     });
   }
 
-  private processGameTick(room: { session: GameSession, players: Player[] }) {
+  private processGameTick(data: { session: GameSession, players: Player[], lastUpdated: number }) {
       const now = Date.now();
-      const last = room.session.lastTick || now;
+      const last = data.session.lastTick || now;
       const delta = now - last;
       
-      // Only tick if > 1 second has passed
       if (delta >= 1000) {
           const seconds = Math.floor(delta / 1000);
           
-          // 1. Time
-          room.session.timeRemaining -= seconds;
-          if (room.session.timeRemaining <= 0) {
-              room.session.timeRemaining = 0;
-              room.session.phase = GamePhase.VICTORY; // Or check game over
+          // Time
+          data.session.timeRemaining -= seconds;
+          if (data.session.timeRemaining <= 0) {
+              data.session.timeRemaining = 0;
+              // Check victory condition (survival)
+              const gameOver = Engine.checkGameOver(data.session.system);
+              if (!gameOver.isOver) {
+                   data.session.phase = GamePhase.VICTORY;
+              }
           }
 
-          // 2. Events & Decay (Simplified: Run decay once per tick cluster)
+          // Logic Loop
           for(let i=0; i<seconds; i++) {
-             // Only run expensive decay logic occasionally or scale it
-             // Scaling it is safer
-             room.session.system = Engine.calculateSystemDecay(room.session.system);
+             data.session.system = Engine.calculateSystemDecay(data.session.system);
              
-             // Random Events (Roughly check every second)
-             if (Math.random() < 0.05) { // 5% chance per second
-                 const evt = Engine.generateEvent(room.session.round, room.session.system.sectors);
+             // Random Events (5% per second)
+             if (Math.random() < 0.05) { 
+                 const evt = Engine.generateEvent(data.session.round, data.session.system.sectors);
                  if (evt) {
-                     room.session.events.unshift(evt);
-                     room.session.system = Engine.applyEventImpact(room.session.system, evt);
+                     data.session.events.unshift(evt);
+                     data.session.system = Engine.applyEventImpact(data.session.system, evt);
                  }
              }
+             
+             // Bot Actions (10% per second per bot)
+             data.players.filter(p => p.isBot).forEach(bot => {
+                 if (Math.random() < 0.1) {
+                     const botAction = ACTIONS.find(a => a.role === bot.role);
+                     if (botAction) {
+                         // Pick random sector
+                         const sectors = data.session.system.sectors;
+                         const target = sectors[Math.floor(Math.random() * sectors.length)].id;
+                         data.session.system = Engine.applyAction(data.session.system, botAction, target);
+                     }
+                 }
+             });
           }
           
-          // 3. Game Over Check
-          const status = Engine.checkGameOver(room.session.system);
+          // Check Defeat
+          const status = Engine.checkGameOver(data.session.system);
           if (status.isOver) {
-              room.session.phase = GamePhase.GAME_OVER;
+              data.session.phase = GamePhase.GAME_OVER;
           }
 
-          room.session.lastTick = now;
+          data.session.lastTick = now;
       }
+  }
+
+  private logAvailableRooms() {
+      const rooms: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && key.startsWith(STORAGE_KEY_PREFIX)) {
+              rooms.push(key.replace(STORAGE_KEY_PREFIX, ''));
+          }
+      }
+      console.log("[SERVER] Available Rooms:", rooms);
   }
 }
 
-const server = new MockServer();
+const backend = new MockBackend();
 
-// --- CLIENT API ---
+// --- CLIENT API WRAPPER ---
+// Simulates network latency for realism
 export const api = {
     async createRoom(hostName: string) {
-        // Simulate Network Delay
-        await new Promise(r => setTimeout(r, 600)); 
-        return server.createRoom(hostName);
+        await new Promise(r => setTimeout(r, 500)); 
+        return backend.createRoom(hostName);
     },
 
     async joinRoom(code: string, playerName: string) {
-        await new Promise(r => setTimeout(r, 600));
-        return server.joinRoom(code, playerName);
+        await new Promise(r => setTimeout(r, 500));
+        return backend.joinRoom(code, playerName);
     },
 
     async getGameState(code: string, playerId: string) {
-        // Fast polling, minimal delay
-        return server.getGameState(code, playerId);
+        // Fast polling
+        return backend.getGameState(code, playerId);
     },
 
     async startGame(code: string) {
-        return server.startGame(code);
+        return backend.startGame(code);
     },
 
     async sendAction(code: string, playerId: string, actionId: string, targetSectorId?: string) {
-        return server.performAction(code, playerId, actionId, targetSectorId);
+        return backend.performAction(code, playerId, actionId, targetSectorId);
     },
 
     async addBot(code: string) {
-        return server.addBot(code);
+        return backend.addBot(code);
     }
 };
