@@ -6,12 +6,10 @@ import LobbyView from './components/LobbyView';
 import { INITIAL_SYSTEM_STATE, ROLE_DESCRIPTIONS, ACTIONS } from './constants';
 import { GamePhase, RoleType, Player, GameSession, Action } from './types';
 import * as Engine from './services/engine';
-import { api, ConnectionStatus } from './services/network'; // Updated Import
+import { api, ConnectionStatus } from './services/network';
 
 export default function App() {
   // --- STATE ---
-  // We keep playerId in session storage to survive refreshes if needed, 
-  // or just memory for now.
   const [playerId, setPlayerId] = useState<string | null>(null);
   const [lobbyCode, setLobbyCode] = useState<string | null>(null);
   
@@ -44,10 +42,11 @@ export default function App() {
               setSession(data.session);
               setPlayers(data.players);
               setConnStatus('CONNECTED');
-          } catch (e) {
+          } catch (e: any) {
               console.error(e);
               setConnStatus('ERROR');
-              setConnError("Lost connection to mainframe");
+              // Display the actual error (e.g., "Room Not Found") to help debugging
+              setConnError(e.message || "Lost connection to mainframe");
           }
       };
 

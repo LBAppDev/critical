@@ -7,7 +7,6 @@ const STORAGE_KEY_PREFIX = 'entropy_room_';
 export type ConnectionStatus = 'IDLE' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 
 // --- MOCK BACKEND SERVER (Running in Browser Memory/LocalStorage) ---
-// This allows multiple tabs to see the same state (Local Multiplayer)
 class MockBackend {
   
   // --- STORAGE HELPERS ---
@@ -33,24 +32,26 @@ class MockBackend {
       localStorage.setItem(key, JSON.stringify(data));
     } catch (e) {
       console.error("[SERVER] Storage Write Error", e);
+      throw new Error("Local Storage Failure: check browser settings or clear data");
     }
   }
 
   // --- CORE API ---
 
   createRoom(hostName: string): { code: string, playerId: string } {
-    // Generate unique 4-letter code (avoiding ambiguous chars)
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; 
+    // Uses letters and numbers (excluding 0, 1, I, O for clarity)
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; 
     let code = '';
     let attempts = 0;
     
+    // Attempt to generate a unique code
     do {
       code = '';
       for(let i=0; i<4; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
       attempts++;
     } while (this.getStore(code) && attempts < 20);
 
-    if (this.getStore(code)) throw new Error("Failed to allocate server capacity (Code Collision)");
+    if (this.getStore(code)) throw new Error("Server Busy: Could not generate unique room code");
 
     const playerId = `HOST-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
     const hostPlayer: Player = {
@@ -70,6 +71,7 @@ class MockBackend {
       lastTick: Date.now()
     };
 
+    // Commit to storage
     this.setStore(code, {
       session: initialSession,
       players: [hostPlayer],
@@ -86,17 +88,16 @@ class MockBackend {
     
     if (!data) {
         console.warn(`[SERVER] Room ${cleanCode} not found in LocalStorage.`);
-        // Debug aid: list available rooms
         this.logAvailableRooms();
         throw new Error(`Room ${cleanCode} not found`);
     }
 
     if (data.session.phase !== GamePhase.LOBBY) {
-        throw new Error("Mission already in progress");
+        throw new Error("Mission In Progress: Access Denied");
     }
 
     if (data.players.length >= 8) {
-        throw new Error("Squad capacity reached");
+        throw new Error("Squad Full");
     }
 
     const playerId = `OP-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
@@ -117,11 +118,18 @@ class MockBackend {
 
   getGameState(code: string, playerId: string): { session: GameSession, players: Player[] } {
     const data = this.getStore(code);
-    if (!data) throw new Error("Connection lost");
     
+    if (!data) {
+        throw new Error("Connection Lost: Room data vanished");
+    }
+    
+    // Check if player exists in this room (security check)
+    const playerExists = data.players.some(p => p.id === playerId);
+    if (!playerExists) {
+        throw new Error("Authentication Failed: Player ID invalid");
+    }
+
     // Lazy Simulation Tick
-    // Only the first person to query in a 'tick window' triggers the update logic
-    // But since this is LocalStorage, we can just update it safely.
     if (data.session.phase === GamePhase.PLAYING) {
        const now = Date.now();
        if (now - (data.session.lastTick || 0) > 1000) {
@@ -181,9 +189,6 @@ class MockBackend {
     const ESSENTIAL = [RoleType.COMMANDER, RoleType.ENGINEER, RoleType.BIO_SEC, RoleType.COMMS];
     const SUPPORT = [RoleType.SECURITY, RoleType.LOGISTICS];
     
-    // Reset non-host roles to ensure optimal distribution? 
-    // No, keep existing, just fill gaps.
-    
     const currentRoles = new Set(players.map(p => p.role).filter(r => r !== null));
     
     players.forEach(p => {
@@ -208,7 +213,7 @@ class MockBackend {
             }
         }
         
-        // Fallback (Duplicates allowed for support roles usually, but for this game: Security)
+        // Fallback
         if (!assigned) assigned = RoleType.SECURITY;
 
         p.role = assigned;
@@ -228,7 +233,6 @@ class MockBackend {
           data.session.timeRemaining -= seconds;
           if (data.session.timeRemaining <= 0) {
               data.session.timeRemaining = 0;
-              // Check victory condition (survival)
               const gameOver = Engine.checkGameOver(data.session.system);
               if (!gameOver.isOver) {
                    data.session.phase = GamePhase.VICTORY;
@@ -253,7 +257,6 @@ class MockBackend {
                  if (Math.random() < 0.1) {
                      const botAction = ACTIONS.find(a => a.role === bot.role);
                      if (botAction) {
-                         // Pick random sector
                          const sectors = data.session.system.sectors;
                          const target = sectors[Math.floor(Math.random() * sectors.length)].id;
                          data.session.system = Engine.applyAction(data.session.system, botAction, target);
@@ -290,17 +293,17 @@ const backend = new MockBackend();
 // Simulates network latency for realism
 export const api = {
     async createRoom(hostName: string) {
-        await new Promise(r => setTimeout(r, 500)); 
+        await new Promise(r => setTimeout(r, 400)); 
         return backend.createRoom(hostName);
     },
 
     async joinRoom(code: string, playerName: string) {
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 400));
         return backend.joinRoom(code, playerName);
     },
 
     async getGameState(code: string, playerId: string) {
-        // Fast polling
+        // Instant return for smoother polling
         return backend.getGameState(code, playerId);
     },
 
